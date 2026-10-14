@@ -26,6 +26,8 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:securepass@postgres_db:5432/network_db
+      # Uncomment the line below and paste your live webhook URL to activate real Slack alerts:
+      # - SLACK_WEBHOOK_URL=https://slack.com
     depends_on:
       postgres_db:
         condition: service_healthy
