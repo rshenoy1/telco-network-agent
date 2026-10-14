@@ -1,0 +1,29 @@
+# ==========================================
+# ENTERPRISE TELCO APP GITIGNORE
+# ==========================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caching and local DB engines
+.chroma/
+.cache/
+
+# Environments & Dependencies
+.venv/
+venv/
+ENV/
+env/
+
+# IDE and Editor System Configurations
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+# Local developer documentation
+understand.md
