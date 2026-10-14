@@ -1,5 +1,6 @@
 import os
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, Depends, Security
@@ -11,6 +12,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 import gradio as gr
 import httpx
+from flashrank import Ranker, RerankRequest
 
 # ==========================================
 # 1. POSTGRESQL ASYNC ENGINE & MODEL CONFIG
@@ -40,31 +42,20 @@ async def get_db_session():
             await session.rollback()
             raise
 
+# Initialize the blazing-fast local Ranker engine inside application memory
+ranker_engine = Ranker()
+
 # ==========================================
-# 2. APPLICATION BOOTSTRAP INITIALIZATION
+# 2. MODERN LIFESPAN BOOTSTRAP INITIALIZATION
 # ==========================================
-app = FastAPI(title="Telecom Network Support Core v2", version="2.0.0")
-
-API_KEY_NAME = "X-Network-Token"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
-
-async def verify_api_token(api_key: str = Security(api_key_header)):
-    """Validates global structural authorization tokens."""
-    if api_key != "noc-secure-vault-token-abc":
-        raise HTTPException(status_code=403, detail="Unauthorized Infrastructure Access Token.")
-    return api_key
-
-chroma_client = chromadb.Client()
-emb_fn = embedding_functions.DefaultEmbeddingFunction()
-vector_db = chroma_client.create_collection(name="network_playbooks", embedding_function=emb_fn)
-memory_db = chroma_client.create_collection(name="incident_topology_logs", embedding_function=emb_fn)
-
-@app.on_event("startup")
-async def app_startup_pipeline():
-    """Initializes tables, seeds runtime RAG vectors and default PostgreSQL rows."""
+@asynccontextmanager
+async def app_lifespan_manager(app: FastAPI):
+    """Executes on-start infrastructure bootstrap logic, then yields control to the API."""
+    # [STARTUP]: Build schema bindings inside PostgreSQL container automatically
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         
+    # Seed baseline Degraded circuit row safely if missing from records
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(CircuitEntity).where(CircuitEntity.circuit_id == "CKT-55412"))
         if not result.scalar_one_or_none():
@@ -72,6 +63,7 @@ async def app_startup_pipeline():
             session.add(seed_ckt)
             await session.commit()
 
+    # Seed ChromaDB Vector Runbooks
     if vector_db.count() == 0:
         vector_db.add(
             documents=[
@@ -83,14 +75,41 @@ async def app_startup_pipeline():
             ids=["runbook_0", "runbook_1", "runbook_2", "runbook_3"],
             metadatas=[{"subsystem": "optical"}, {"subsystem": "sla"}, {"subsystem": "routing"}, {"subsystem": "ont"}]
         )
+        
+    yield  # The application runs and processes runtime API traffic here
+    
+    # [SHUTDOWN]: Safely drain and clear connection pools when the container stops
+    await engine.dispose()
+
+# Initialize core FastAPI Application Instance with modern Lifespan manager
+app = FastAPI(
+    title="Telecom Network Support Core v2.1", 
+    version="2.1.0",
+    lifespan=app_lifespan_manager
+)
+
+API_KEY_NAME = "X-Network-Token"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+
+async def verify_api_token(api_key: str = Security(api_key_header)):
+    """Validates global structural authorization tokens."""
+    if api_key != "noc-secure-vault-token-abc":
+        raise HTTPException(status_code=403, detail="Unauthorized Infrastructure Access Token.")
+    return api_key
+
+# In-Memory Database instances
+chroma_client = chromadb.Client()
+emb_fn = embedding_functions.DefaultEmbeddingFunction()
+vector_db = chroma_client.create_collection(name="network_playbooks", embedding_function=emb_fn)
+memory_db = chroma_client.create_collection(name="incident_topology_logs", embedding_function=emb_fn)
 
 # ==========================================
 # 3. VERIFIED DATA INTERACTION SCHEMAS
 # ==========================================
 class SupportRequest(BaseModel):
-    node_id: str = Field(..., example="node_manhattan_04")
-    circuit_id: str = Field(..., example="CKT-55412")
-    diagnostic_query: str = Field(..., example="Failing with NET-ERR-502")
+    node_id: str = Field(..., description="The unique name/ID of the routing node", example="node_manhattan_04")
+    circuit_id: str = Field(..., description="The targeted telemetry hardware circuit path", example="CKT-55412")
+    diagnostic_query: str = Field(..., description="The inbound error query token or text prompt", example="Failing with NET-ERR-502")
 
 # ==========================================
 # 4. TECHNICAL DATA MUTATION REPOS
@@ -121,7 +140,7 @@ class NetworkDiagnosticTools:
         return {"status": "Success", "message": "Signal cycle frame issued to upstream hardware frame link."}
 
 # ==========================================
-# 5. CORE ROUTING EXECUTION ENGINE
+# 5. CORE ROUTING EXECUTION ENGINE (TWO-STAGE RERANK)
 # ==========================================
 class NetworkOrchestrationEngine:
     @staticmethod
@@ -140,13 +159,31 @@ class NetworkOrchestrationEngine:
 
     @staticmethod
     async def process_playbook_rag(query: str) -> str:
-        """Retrieves targeted operations instructions based on vector context matches."""
-        results = vector_db.query(query_texts=[query], n_results=1)
-        if results['documents'] and results['documents']:
-            retrieved_runbook = results['documents']
-        else:
-            retrieved_runbook = "No runbook configuration located."
-        return f"Verified Runbook Directive: {retrieved_runbook}"
+        """Retrieves candidates via ChromaDB, then runs cross-encoder Reranking."""
+        # Stage 1: Coarse Retrieval - pull candidate pool matches (n_results=3)
+        results = vector_db.query(query_texts=[query], n_results=3)
+        
+        if not results['documents'] or not results['documents'][0]:
+            return "Verified Runbook Directive: No initial runbook candidates located."
+            
+        candidate_chunks = results['documents'][0]
+        
+        # Format raw chunks into standard text dictionaries that FlashRank reads
+        formatted_docs = [{"id": idx, "text": doc} for idx, doc in enumerate(candidate_chunks)]
+        
+        # Stage 2: Contextual Cross-Attention Reranking
+        rerank_req = RerankRequest(query=query, passages=formatted_docs)
+        rerank_results = ranker_engine.rerank(rerank_req)
+        
+        if not rerank_results:
+            return "Verified Runbook Directive: Reranker failed to parse context scores."
+            
+        # FlashRank automatically sorts the list, moving the highest scoring item to Index 0
+        top_match = rerank_results[0]
+        highest_scoring_chunk = top_match['text']
+        confidence_score = round(top_match['score'], 4)
+        
+        return f"Verified Runbook Directive (Rerank Confidence: {confidence_score}): {highest_scoring_chunk}"
 
     @staticmethod
     async def process_hardware_agent(session: AsyncSession, query: str, circuit_id: str) -> str:
@@ -219,8 +256,8 @@ def run_noc_interface_bridge(engineer_message, history):
 
 demo = gr.ChatInterface(
     fn=run_noc_interface_bridge,
-    title="NOC Automated Incident Triage Dashboard v2",
-    description="Telecom Network Operations Center runtime orchestration terminal. Triaging errors with Async PostgreSQL storage connections.",
+    title="NOC Automated Incident Triage Dashboard v2.1",
+    description="Telecom Network Operations Center runtime orchestration terminal. Triaging errors with Async PostgreSQL storage and Cross-Encoder Reranking.",
     examples=["What does error code NET-ERR-502 mean?", "Trigger line diagnostic loop to fix attenuation drops.", "Cycle port link to provision the circuit frame."]
 )
 

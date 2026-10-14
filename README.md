@@ -1,6 +1,6 @@
 # 🛰️ Enterprise Telecom Network Triage & Incident Engine
 
-A production-grade, secure, multi-agent AI architecture engineered for telecom Network Operations Centers (NOC). The platform integrates **FastAPI** as a high-performance backend core, **Gradio** as an operational frontend UI, semantic routing, hybrid vector RAG retrieval, infrastructure tool calling, and input/output validation guardrails.
+A production-grade, secure, multi-agent AI architecture engineered for telecom Network Operations Centers (NOC). The platform integrates **FastAPI** as a high-performance backend core, **Gradio** as an operational frontend UI, semantic routing, **two-stage vector + cross-encoder reranking retrieval**, infrastructure tool calling, and input/output validation guardrails.
 
 ---
 
@@ -9,7 +9,7 @@ A production-grade, secure, multi-agent AI architecture engineered for telecom N
 ```mermaid
 graph TD
     User([Operations Engineer]) -->|Issue Commands / Triage| Gradio[Gradio Web Terminal]
-    Gradio -->|REST Framework / Async Threads| FastAPI[FastAPI Backend Core Core]
+    Gradio -->|REST Framework / Async Threads| FastAPI[FastAPI Backend Core]
     
     subgraph FastAPI Core
         Guard[Inbound Command Security Filter] --> Router{Network Semantic Router}
@@ -17,6 +17,7 @@ graph TD
         
         Router -->|Triage / Lookups| RAG[Playbook RAG Engine]
         RAG --> Chroma[(ChromaDB Runbook Repositories)]
+        RAG --> Rerank[FlashRerank Cross-Encoder Layer]
         
         Router -->|Hardware Automation Interventions| Agent[Hardware Diagnostics Agent]
         Agent --> Tools{Technical Macro Tools}
@@ -24,7 +25,7 @@ graph TD
         Tools -->|cycle_ont_port| OSS
     end
     
-    RAG --> Gen[Compile Verification Summary]
+    Rerank --> Gen[Compile Verification Summary]
     OSS --> Gen
     Gen --> Eval{Ragas Grounding Compliance Check}
     Eval -->|Success / Validated| Return[Output Validated Telemetry Logs]
@@ -42,6 +43,7 @@ sequenceDiagram
     participant API as FastAPI Network Core
     participant Router as Semantic Router
     participant RAG as Runbook Vector RAG
+    participant Rerank as Cross-Encoder Reranker
     participant Agent as Diagnostic Agent
     participant Network as Hardware Gateways (OLT/ONT)
     
@@ -50,9 +52,10 @@ sequenceDiagram
     API->>Router: Parse Telemetry Context Intent
     
     alt Playbook Lookup Path (Error codes, SLAs, Procedures)
-        Router->>RAG: Trigger Playbook Database Search
-        RAG->>RAG: Match Error Token Signatures
-        RAG-->>API: Extract Resolution Instructions
+        Router->>RAG: Trigger Broad ChromaDB Vector Search (Top-K)
+        RAG->>Rerank: Pass Raw Candidate Chunks
+        Rerank->>Rerank: Compute Contextual Attention Scores
+        Rerank-->>API: Extract Highest Scoring Instruction Document
     else Live Infrastructure Action Path (Line resets, Calibrations)
         Router->>Agent: Map Command Strings to Action Macros
         Agent->>Network: Fire Port Loopback Test/Laser Read Adjustments
@@ -75,25 +78,20 @@ sequenceDiagram
 
 ## 🔍 Code Section In-Depth Breakdown
 
-### 🛡️ Section 1 & 4: Authentication Gate & Data Validation Validation
+### 🛡️ Section 1 & 4: Authentication Gate & Data Validation
 *   **Security Injection Layer**: Integrates dependency-injected security handlers using `APIKeyHeader`. Incoming external microservices must present a secure header key token (`X-Network-Token`) before runtime operations can execute.
 *   **Pydantic Data Schemas**: The `SupportRequest` schema acts as a data firewall. It parses structure properties, checking that parameters like `circuit_id` or `diagnostic_query` strictly align with expectations, throwing instant automated `422 Unprocessable Entity` errors if bad input types are intercepted.
 
-### 🗄️ Section 2 & 3: Local In-Memory ChromaDB Vector Databases
-*   **On-the-fly Token Embeddings**: Initializes a local in-memory vectorized repository using the `all-MiniLM-L6-v2` tokenizer model. 
-*   **Semantic Matching Registry**: Seed entries parse structural playbook rules (e.g., matching error string definitions like `NET-ERR-502` to precise optical alignment directives). This enables conceptual searching, meaning a query about "unstable laser beams" maps correctly to optical runbooks even if keywords don't match exactly.
+### 🗄️ Section 2 & 3: Local Vector Databases & Two-Stage Reranking
+*   **Stage 1 - Coarse Vector Search**: Initializes a local in-memory vectorized repository using ChromaDB and the `all-MiniLM-L6-v2` tokenizer model to pull a wide pool of candidate playbooks (`n_results=3`).
+*   **Stage 2 - Cross-Encoder Reranking**: Integrates a local, CPU-optimized transformer model via `FlashRerank` (`ms-marco-MiniLM-L-6-v2`). It calculates the context relationship between your query and the raw document text blocks, filtering out weak options and moving the high-confidence directive straight to the top of your prompt context budget.
 
-### 🛠️ Section 5: Hardware Automation Diagnostic Tools
-*   **Simulated Interface Control**: Emulates production operations interfaces that alter settings on physical network hardware like Optical Line Terminals (OLT) and Optical Network Terminals (ONT).
-*   **State Database Mutations**: When executed, these scripts actively update values inside the core system dictionary database. For example, running `trigger_line_diagnostic_loop` dynamically corrects a degraded hardware attenuation level from an unsafe `-32.4 dBm` back to a functional, stable running state of `-22.1 dBm`.
+### 🛠️ Section 5: Asynchronous PostgreSQL Persistence
+*   **Relational Storage Topology**: Replaces unstable mock memory dictionaries with a dedicated, isolated PostgreSQL container database layer. Telemetry rows are queried, modified, and committed using asynchronous `SQLAlchemy 2.0` and `asyncpg` execution channels.
 
-### 🧠 Section 6: Semantic Router & Security Firewall
+### 🧠 Section 6 & 7: Semantic Router, Firewalls, and HTTPX Piping
 *   **Malicious Inbound Filter**: Intercepts string payloads to isolate common system exploitation vectors (e.g., catching commands like `sudo rm` or `format nvram`).
-*   **Intent Mapping**: Classifies input data into separate logical execution pathways. If action keywords (such as "reset", "cycle", or "fix") are observed, the system switches to the interactive **Hardware Automation Agent**. Otherwise, it safely defaults to general **Playbook RAG Triage** lookups.
-
-### 🧵 Section 9: Thread Loop Bridge Middleware
-*   **The Issue**: Gradio executes its functional callbacks inside discrete background thread workers, meaning a worker thread doesn't natively share access to Python's main running asynchronous processing event loop.
-*   **The Solution**: The custom loop middleware bridges this gap. It attempts to latch onto the primary running loop, falls back to finding registered application thread loops, or forcefully instantiates an isolated `asyncio.new_event_loop()` environment. This guarantees that background user queries can execute deep async operations without crashing.
+*   **Decoupled Network Piping**: Because Gradio components process tasks inside separate background thread pools, they cannot share active SQLAlchemy database loops. The application solves this by using an internal `httpx` network client—Gradio forwards prompts as real network calls to the backend API gateway on port `8000`, ensuring database transactions stay perfectly bound to isolated, thread-safe request lifecycles.
 
 ---
 
@@ -101,13 +99,12 @@ sequenceDiagram
 
 ### 1. Installation Requirements
 ```bash
-pip install fastapi uvicorn chromadb pydantic gradio
+pip install fastapi uvicorn chromadb pydantic gradio sqlalchemy asyncpg httpx flashrerank
 ```
 
-### 2. Launch the Infrastructure Server Engine
-Execute the following unified startup command string inside your terminal:
+### 2. Launch the Multi-Container Infrastructure Stack
 ```bash
-python -m uvicorn main:app --reload --port 8000
+docker compose up --build -d
 ```
 
 ### 3. Verification Testing Gateways
