@@ -5,3 +5,5 @@ pydantic==2.6.4
 gradio==4.21.0
 huggingface_hub==0.23.0
 watchfiles==0.21.0
+sqlalchemy==2.0.28
+asyncpg==0.29.0

@@ -1,0 +1,34 @@
+
+services:
+  # 1. Containerized PostgreSQL Database Engine
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: telecom_postgres_container
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: securepass
+      POSTGRES_DB: network_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d network_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Main FastAPI + Gradio Web Application Container
+  network_agent:
+    build: .
+    container_name: active-triage-container
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:securepass@postgres_db:5432/network_db
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
